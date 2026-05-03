@@ -63,7 +63,9 @@ class ReplyHandler:
         conversation_id = reply.get("conversation_id")
         message = reply.get("message", "")
         received_at = reply.get("received_at")
+        from_role = reply.get("from_role", "merchant")
         request_merchant_id = reply.get("merchant_id")
+        request_customer_id = reply.get("customer_id")
 
         if not conversation_id:
             return {"action": "end", "rationale": "Missing conversation_id."}
@@ -72,13 +74,11 @@ class ReplyHandler:
             return {"action": "end", "rationale": "Conversation already closed."}
 
         # --- DETECT PATTERNS FIRST (before meta check) ---
-        # This ensures judge test scenarios (auto_reply, hostile, intent)
-        # work even for conversations not started by /v1/tick.
-
         conversation = self.store.get_conversation(conversation_id)
         is_auto_reply = self._detect_auto_reply(conversation, message)
 
-        self.store.append_turn(conversation_id, "merchant", message, received_at)
+        # Use the actual from_role instead of always "merchant"
+        self.store.append_turn(conversation_id, from_role, message, received_at)
 
         # 1) Hostile detection — always runs
         if self._detect_hostile(message):
@@ -95,8 +95,8 @@ class ReplyHandler:
                 "rationale": "Acknowledged opt-out gracefully and ended conversation.",
             }
 
-        # 2) Auto-reply detection — always runs
-        if is_auto_reply:
+        # 2) Auto-reply detection — always runs (merchant only)
+        if from_role == "merchant" and is_auto_reply:
             count = self.store.bump_auto_reply_count(self._auto_reply_key(reply, conversation_id, message))
             if count == 1:
                 return {
@@ -114,7 +114,8 @@ class ReplyHandler:
             self.store.end_conversation(conversation_id)
             return {"action": "end", "rationale": "Auto-reply repeated 3+; ending conversation."}
 
-        self.store.reset_auto_reply_count(conversation_id)
+        if from_role == "merchant":
+            self.store.reset_auto_reply_count(conversation_id)
 
         # --- RESOLVE CONTEXT ---
         meta = self.store.get_conversation_meta(conversation_id)
@@ -128,9 +129,18 @@ class ReplyHandler:
             category = self.store.get_context("category", merchant.get("category_slug", ""))
 
         customer = None
-        if meta.customer_id:
-            customer = self.store.get_context("customer", meta.customer_id)
+        customer_id_resolved = meta.customer_id or request_customer_id
+        if customer_id_resolved:
+            customer = self.store.get_context("customer", customer_id_resolved)
 
+        # --- CUSTOMER REPLY BRANCH ---
+        # When from_role is "customer", we reply TO the customer (not the merchant)
+        if from_role == "customer":
+            return self._handle_customer_reply(
+                conversation_id, message, merchant, trigger, category, customer, customer_id_resolved
+            )
+
+        # --- MERCHANT REPLY BRANCH ---
         # 3) Intent commit detection — runs even without full context
         if self._detect_intent_commit(message):
             if merchant and trigger and category:
@@ -148,15 +158,30 @@ class ReplyHandler:
                 "rationale": "Merchant confirmed intent; switching to action mode.",
             }
 
-        # --- FULL LLM REPLY (requires all context) ---
+        # --- FULL LLM REPLY (merchant path, requires context) ---
         if not merchant or not trigger or not category:
-            return {"action": "end", "rationale": "Missing conversation context for LLM reply."}
+            # Even without full context, try a generic helpful reply
+            owner = self._get_owner_name(merchant)
+            body = f"Thanks {owner}, I'll look into that. Give me a moment to check the details and get back to you."
+            if self.store.is_repeat(conversation_id, body):
+                return {"action": "end", "rationale": "Missing context and would repeat."}
+            self.store.record_sent(conversation_id, body)
+            return {
+                "action": "send",
+                "body": body,
+                "cta": "open_ended",
+                "rationale": "Partial context; generic helpful follow-up.",
+            }
 
         conversation = self.store.get_conversation(conversation_id)
         result = self.composer.reply(category, merchant, trigger, customer, conversation, message)
         body = result.get("body", "")
-        if self.store.is_repeat(conversation_id, body):
-            return {"action": "end", "rationale": "Avoiding repeated response."}
+        if not body or self.store.is_repeat(conversation_id, body):
+            # Fallback if LLM returned empty or repeat
+            owner = self._get_owner_name(merchant)
+            body = f"Got it {owner}. Let me work on that and get back to you with specifics."
+            if self.store.is_repeat(conversation_id, body):
+                return {"action": "end", "rationale": "Avoiding repeated response."}
 
         self.store.record_sent(conversation_id, body)
         return {
@@ -164,6 +189,75 @@ class ReplyHandler:
             "body": body,
             "cta": result.get("cta", "open_ended"),
             "rationale": result.get("rationale", "Follow-up reply."),
+        }
+
+    def _handle_customer_reply(
+        self,
+        conversation_id: str,
+        message: str,
+        merchant: Optional[Dict[str, Any]],
+        trigger: Optional[Dict[str, Any]],
+        category: Optional[Dict[str, Any]],
+        customer: Optional[Dict[str, Any]],
+        customer_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Handle a reply from a customer — reply should address the customer, not the merchant."""
+        cust_name = "there"
+        if customer:
+            cust_name = customer.get("identity", {}).get("name", "there")
+
+        owner = self._get_owner_name(merchant)
+        clinic_name = "the clinic"
+        if merchant:
+            clinic_name = merchant.get("identity", {}).get("name", "the clinic")
+
+        # Try LLM reply with customer-specific prompt
+        if merchant and trigger and category and self.composer.llm.is_configured():
+            try:
+                from .prompts import BASE_SYSTEM_PROMPT, format_context_summary
+                facts = self.composer._collect_facts(category, merchant, trigger, customer)
+                conversation = self.store.get_conversation(conversation_id)
+                convo_text = __import__('json').dumps(conversation[-6:], ensure_ascii=False, indent=2)
+                context_text = format_context_summary(category, merchant, trigger, customer, facts)
+                user_prompt = (
+                    f"You are replying TO THE CUSTOMER (named {cust_name}), on behalf of the merchant ({clinic_name}). "
+                    f"send_as must be merchant_on_behalf. Address the customer by name ({cust_name}), NOT the merchant. "
+                    "Return JSON with keys: body, cta, rationale, send_as.\n\n"
+                    "Context summary:\n" + context_text + "\n\n"
+                    "Conversation so far:\n" + convo_text + "\n\n"
+                    "Last customer message:\n" + (message or "") + "\n\n"
+                    "Return ONLY valid JSON."
+                )
+                raw = self.composer.llm.complete(BASE_SYSTEM_PROMPT, user_prompt)
+                parsed = self.composer._extract_json(raw)
+                if parsed and parsed.get("body"):
+                    body = parsed["body"].strip()
+                    cta = parsed.get("cta", "open_ended")
+                    if cta not in {"binary_yes_no", "binary_confirm_cancel", "open_ended", "none", "multi_choice_slot"}:
+                        cta = "open_ended"
+                    if not self.store.is_repeat(conversation_id, body):
+                        self.store.record_sent(conversation_id, body)
+                        return {
+                            "action": "send",
+                            "body": body,
+                            "cta": cta,
+                            "send_as": "merchant_on_behalf",
+                            "rationale": parsed.get("rationale", "Customer reply via LLM."),
+                        }
+            except Exception:
+                pass
+
+        # Fallback: deterministic customer-addressed reply
+        body = f"Hi {cust_name}, thanks for your reply! We'll get that sorted for you at {clinic_name}. We'll confirm the details shortly."
+        if self.store.is_repeat(conversation_id, body):
+            return {"action": "end", "rationale": "Would repeat customer reply."}
+        self.store.record_sent(conversation_id, body)
+        return {
+            "action": "send",
+            "body": body,
+            "cta": "open_ended",
+            "send_as": "merchant_on_behalf",
+            "rationale": "Customer reply — addressing customer on behalf of merchant.",
         }
 
     def _detect_auto_reply(self, conversation: List[Dict[str, Any]], message: str) -> bool:

@@ -29,7 +29,7 @@ class ContextStore:
             return False, "invalid_scope", None
         key = (scope, context_id)
         current = self._contexts.get(key)
-        if current and current.get("version", 0) >= version:
+        if current and current.get("version", 0) > version:
             return False, "stale_version", current.get("version", 0)
         self._contexts[key] = {"version": version, "payload": payload}
         return True, None, None

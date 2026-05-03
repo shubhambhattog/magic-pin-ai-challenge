@@ -9,3 +9,8 @@ __pycache__/
 .gitignore
 docs/
 dataset/
+judge_simulator.py
+run_test.ps1
+test_runner.py
+*.log
+.uvicorn.pid

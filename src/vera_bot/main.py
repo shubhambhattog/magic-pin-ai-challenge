@@ -138,8 +138,6 @@ async def tick(body: TickBody) -> Dict[str, Any]:
         customer_id = trigger.get("customer_id")
         if customer_id:
             customer = store.get_context("customer", customer_id)
-            if not customer:
-                continue
 
         candidates.append(
             {
